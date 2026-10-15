@@ -1,0 +1,15 @@
+# Evaluation answers are ground truth and must never be retrieved as evidence.
+evaluation/
+
+# Generated incident exports are query fixtures, not source documentation.
+scenarios/generated/
+
+# Runtime and dependency artifacts.
+**/__pycache__/
+**/.venv/
+**/node_modules/
+**/dist/
+.git/
+.tools/
+target/
+runtime-logs/

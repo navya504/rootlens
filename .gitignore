@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.tools/
+target/
+*.log
+runtime-logs/
+telemetry-data/
+qdrant-data/
+.rootlens/
+postgres-data/
+scenarios/generated/
+node_modules/
+dist/

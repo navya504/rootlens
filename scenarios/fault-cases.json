@@ -1,0 +1,23 @@
+[
+  {
+    "case_id": "SHOP-COUPON-001",
+    "title": "ROOT10 applies a flat discount instead of a percentage",
+    "reproduction": "Add Studio Headphones and apply ROOT10. Compare the cart preview and confirmed checkout total.",
+    "expected_root_cause": "The UI calculates 10 percent while PricingService caps and returns a fixed $10 discount.",
+    "source": "src/main/java/dev/rootlens/shop/PricingService.java"
+  },
+  {
+    "case_id": "SHOP-PAYMENT-001",
+    "title": "A delayed payment response causes duplicate captures",
+    "reproduction": "Place an order with a total of at least $100, then inspect its payment ledger in /dev.",
+    "expected_root_cause": "The first capture succeeds, the response times out, and ShopService retries with a different idempotency key.",
+    "source": "src/main/java/dev/rootlens/shop/ShopService.java"
+  },
+  {
+    "case_id": "SHOP-INVENTORY-001",
+    "title": "Successful checkouts do not reduce available inventory",
+    "reproduction": "Buy the same product repeatedly and compare availability with successful orders.",
+    "expected_root_cause": "InventoryService verifies stock but never decrements it after reservation.",
+    "source": "src/main/java/dev/rootlens/shop/InventoryService.java"
+  }
+]

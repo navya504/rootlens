@@ -1,0 +1,23 @@
+[
+  {
+    "case_id": "SHOP-COUPON-001",
+    "gold_root_cause": "The cart previews a ten-percent discount, but PricingService subtracts a flat $10.",
+    "gold_file": "src/main/java/dev/rootlens/shop/PricingService.java",
+    "gold_symbol": "discount",
+    "verification": "Compare the storefront preview with the total returned by POST /api/shop/checkout."
+  },
+  {
+    "case_id": "SHOP-PAYMENT-001",
+    "gold_root_cause": "After the first capture succeeds with an ambiguous timeout, ShopService retries using a new idempotency key and records a second capture.",
+    "gold_file": "src/main/java/dev/rootlens/shop/ShopService.java",
+    "gold_symbol": "checkout",
+    "verification": "GET /api/shop/orders/{id}/captures returns two captures with different keys for an order of at least $100."
+  },
+  {
+    "case_id": "SHOP-INVENTORY-001",
+    "gold_root_cause": "InventoryService checks the available quantity but never decrements inventory after a successful reservation.",
+    "gold_file": "src/main/java/dev/rootlens/shop/InventoryService.java",
+    "gold_symbol": "reserve",
+    "verification": "Repeat checkout for the same product; the listed available count stays unchanged."
+  }
+]
