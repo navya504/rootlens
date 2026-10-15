@@ -33,19 +33,32 @@ Open `/dev` to investigate the three reproducible shopping-app defects. The dark
 
 Open `/view` for the Spring Boot shopping application dependency map. It shows the relationships among `ShopController`, `ShopService`, `InventoryService`, `PricingService`, `PaymentService`, and `ShopModels`, with source inspection for each component. The map is based on application service dependencies and does not expose RAG indexing internals.
 
-The local source search can use BM25 alone or combine it with Ollama embeddings when configured and indexed. The score displayed with each citation is a retrieval relevance score, not a calibrated root-cause probability. Ollama setup and configuration are described below.
+The source search combines local BM25 with Pinecone semantic search when Pinecone is configured and indexed. Without Pinecone credentials, the app can use the local Ollama vector index or fall back to BM25. Citation scores rank retrieved evidence; they are not calibrated root-cause probabilities.
 
 Selecting a request displays its correlated events in timestamp order. These events are observations from the local app session; the timeline does not invent span duration or imply that an unrelated request caused the selected catalog defect.
 
 ### Demo run-through
 
 1. Start the app with `.\run.ps1`; open the printed storefront URL and `/dev` in separate tabs.
-2. On `/dev`, wait for **HYBRID SOURCE SEARCH** before presenting vector scores. If the status says **REINDEX NEEDED**, select **Reindex source** and wait for completion. If it says **OLLAMA OFFLINE**, the app remains usable in BM25 mode and correctly labels vector scores unavailable.
+2. On `/dev`, wait for **HYBRID SOURCE SEARCH** before presenting vector scores. With Pinecone configured, select **Reindex source** after source changes and wait for completion. Without Pinecone or local embeddings, the app remains usable in BM25 mode and labels vector scores unavailable.
 3. On `/dev`, select **Analyse defect** for the duplicate-payment defect. The first analysis creates a correlated demo trace with the timeout and retry sequence; ordinary storefront orders do not inject this payment fault.
 4. Return to `/dev`. Select **Analyse request** on that order to show the correlated event timeline, capture ledger, source citations, root cause, and remediation. Open the RCA report and download it.
 5. Analyse the coupon and inventory defects. If no matching request exists, the first analysis creates a correlated demo trace for that defect; the coupon trace contains no payment timeout or retry. Use **Apply fix to source** for the allow-listed demo patches, then close resolved defects from the queue. Open `/view` to inspect the radial shopping-service dependency graph.
 
-Observed orders and mock payment records live in memory and reset when the app restarts. The local vector index persists in `.rootlens/` and should be reindexed after source changes.
+Observed orders and mock payment records live in memory and reset when the app restarts. Pinecone vectors persist remotely; reindex after source changes.
+
+### Pinecone vector search
+
+RootLens can use the configured Pinecone serverless index with its integrated `llama-text-embed-v2` model (1024 dimensions, cosine metric). Pinecone generates embeddings for indexed code chunks and search queries; Ollama remains optional for local answer generation. Configure these environment variables before starting RootLens:
+
+```powershell
+$env:PINECONE_API_KEY = '<your Pinecone API key>'
+$env:PINECONE_INDEX_HOST = 'rootlens-code-lp36wm1.svc.aped-4627-b74a.pinecone.io'
+$env:PINECONE_NAMESPACE = 'rootlens-dev'
+.\run.ps1
+```
+
+The API key is read only from the environment and must not be committed to the repository. Pinecone becomes the vector backend only when the key is present; otherwise the app retains the local vector/BM25 behavior. Code chunks are sent to Pinecone for indexing and semantic search, so use this mode only where that source-code transfer is allowed. Select **Reindex source** from `/dev` after configuring the connection.
 
 ### Optional local embeddings and answer generation
 

@@ -36,11 +36,13 @@ public class CodeKnowledgeService {
     private final Path sourceRoot = Path.of("src", "main", "java", "dev", "rootlens", "shop");
     private final LocalOllamaClient ollama;
     private final LocalVectorStore vectors;
+    private final PineconeVectorStore pinecone;
     private volatile List<CodeSource> indexedChunks = List.of();
 
-    public CodeKnowledgeService(LocalOllamaClient ollama, LocalVectorStore vectors) {
+    public CodeKnowledgeService(LocalOllamaClient ollama, LocalVectorStore vectors, PineconeVectorStore pinecone) {
         this.ollama = ollama;
         this.vectors = vectors;
+        this.pinecone = pinecone;
     }
 
     public Map<String, Object> status() {
@@ -58,10 +60,13 @@ public class CodeKnowledgeService {
 
     public List<ChunkInspection> chunkInspection() {
         List<CodeSource> chunks = index();
+        // Do not fetch every full 1024-dimensional vector for the list page. Load the
+        // selected chunk's vector through /rag/chunks/{index}/embedding on demand.
+        boolean remoteReady = pinecone.configured() && pinecone.readyFor(chunks.size());
         List<ChunkInspection> result = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i++) {
             CodeSource chunk = chunks.get(i);
-            double[] vector = vectors.vector(chunk);
+            double[] vector = pinecone.configured() ? null : vectors.vector(chunk);
             String input = "File: " + chunk.path() + "\nMethod: " + chunk.symbol() + "\n" + chunk.content();
             List<Double> preview = vector == null ? List.of() : java.util.Arrays.stream(vector).limit(16).boxed().toList();
             double norm = 0, minimum = 0, maximum = 0;
@@ -76,7 +81,7 @@ public class CodeKnowledgeService {
                 norm = Math.sqrt(norm);
             }
             result.add(new ChunkInspection(i, chunk.path(), chunk.symbol(), chunk.startLine(), chunk.endLine(),
-                chunk.content(), input, vector != null, vector == null ? 0 : vector.length, preview,
+                chunk.content(), input, vector != null || remoteReady, vector == null ? (remoteReady ? pinecone.dimensions() : 0) : vector.length, preview,
                 norm, minimum, maximum));
         }
         return List.copyOf(result);
@@ -85,13 +90,23 @@ public class CodeKnowledgeService {
     public EmbeddingDetails chunkEmbedding(int index) {
         List<CodeSource> chunks = index();
         if (index < 0 || index >= chunks.size()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Chunk not found.");
-        double[] vector = vectors.vector(chunks.get(index));
-        if (vector == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "This chunk has not been embedded yet. Reindex after connecting Ollama.");
-        return new EmbeddingDetails(ollama.embeddingModel(), vector.length, vector);
+        double[] vector = pinecone.configured()
+            ? pinecone.fetchValues(List.of(chunks.get(index))).get(pinecone.id(chunks.get(index)))
+            : vectors.vector(chunks.get(index));
+        if (vector == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, pinecone.configured()
+            ? "This chunk has not been embedded in the configured Pinecone namespace. Reindex the source."
+            : "This chunk has not been embedded yet. Reindex after connecting Ollama.");
+        return new EmbeddingDetails(pinecone.configured() ? "llama-text-embed-v2 · Pinecone hosted" : ollama.embeddingModel(), vector.length, vector);
     }
 
     public synchronized Map<String, Object> reindex() {
         indexedChunks = loadChunks();
+        if (pinecone.configured()) {
+            boolean indexed = pinecone.upsert(indexedChunks);
+            return reindexResponse(indexed
+                ? "Upserted " + indexedChunks.size() + " code chunks into Pinecone namespace " + pinecone.namespace() + "."
+                : "Pinecone indexing failed: " + pinecone.lastError());
+        }
         int coveredBefore = (int) vectors.coveredCount(indexedChunks);
         List<CodeSource> missing = indexedChunks.stream().filter(chunk -> !vectors.has(chunk)).toList();
         // Small batches avoid overloading local Ollama when source methods are large; each successful
@@ -130,15 +145,25 @@ public class CodeKnowledgeService {
         Map<String, Double> lexicalScores = new HashMap<>();
         lexical.forEach(source -> lexicalScores.put(key(source), source.score()));
         double maxLexical = lexical.stream().mapToDouble(CodeSource::score).max().orElse(0);
-        List<double[]> queryVectors = vectors.coveredCount(chunks) == chunks.size() && !chunks.isEmpty()
-            ? ollama.embed(List.of(question)) : List.of();
-        double[] queryVector = queryVectors.size() == 1 ? queryVectors.getFirst() : new double[0];
-        boolean hybrid = vectors.compatible(chunks, queryVector);
-        if (!hybrid) queryVector = new double[0];
         Map<String, Double> semanticScores = new HashMap<>();
-        if (hybrid) for (CodeSource chunk : candidates) {
-            double similarity = vectors.similarity(chunk, queryVector);
-            if (Double.isFinite(similarity)) semanticScores.put(key(chunk), similarity);
+        boolean hybrid;
+        if (pinecone.configured()) {
+            Map<String, CodeSource> byKey = new HashMap<>();
+            candidates.forEach(chunk -> byKey.put(key(chunk), chunk));
+            for (PineconeVectorStore.SemanticMatch match : pinecone.search(question, 30)) {
+                String matchKey = match.path() + "#" + match.symbol() + "#" + match.startLine();
+                if (byKey.containsKey(matchKey)) semanticScores.put(matchKey, match.score());
+            }
+            hybrid = !semanticScores.isEmpty() && pinecone.readyFor(chunks.size());
+        } else {
+            List<double[]> queryVectors = vectors.coveredCount(chunks) == chunks.size() && !chunks.isEmpty()
+                ? ollama.embed(List.of(question)) : List.of();
+            double[] queryVector = queryVectors.size() == 1 ? queryVectors.getFirst() : new double[0];
+            hybrid = vectors.compatible(chunks, queryVector);
+            if (hybrid) for (CodeSource chunk : candidates) {
+                double similarity = vectors.similarity(chunk, queryVector);
+                if (Double.isFinite(similarity)) semanticScores.put(key(chunk), similarity);
+            }
         }
         List<CodeSource> ranked;
         if (hybrid) {
@@ -151,7 +176,7 @@ public class CodeKnowledgeService {
         } else ranked = lexical.stream().limit(4).toList();
         List<VectorPoint> points = vectorPoints(candidates, lexicalScores, maxLexical, semanticScores, hybrid, ranked);
         String retrieval = hybrid
-            ? "hybrid retrieval · 45% BM25 + 55% cosine similarity · " + ollama.embeddingModel()
+            ? "hybrid retrieval · 45% BM25 + 55% cosine similarity · " + (pinecone.configured() ? "Pinecone llama-text-embed-v2" : ollama.embeddingModel())
             : "local BM25 · method-level source chunks with file and line citations";
         var generated = generateWithLocalModel && !ranked.isEmpty()
             ? ollama.generate(question, ranked) : java.util.Optional.<String>empty();
@@ -322,6 +347,35 @@ public class CodeKnowledgeService {
     }
 
     private Map<String, Object> statusFor(List<CodeSource> chunks) {
+        if (pinecone.configured()) {
+            var stats = pinecone.stats();
+            long covered = stats.map(pinecone::namespaceCount).orElse(0L);
+            int dimensions = stats.map(pinecone::dimensions).orElse(1024);
+            boolean indexed = !chunks.isEmpty() && covered >= chunks.size();
+            Map<String, Object> state = new LinkedHashMap<>();
+            state.put("name", "RootLens Java source KB");
+            state.put("chunks", chunks.size());
+            state.put("vectors", Math.min(covered, chunks.size()));
+            state.put("vectorsMissing", Math.max(0, chunks.size() - covered));
+            state.put("vectorsIndexed", indexed);
+            state.put("vectorDimensionsConsistent", indexed && dimensions == 1024);
+            state.put("dimensions", dimensions);
+            state.put("embeddingModel", "llama-text-embed-v2 · Pinecone hosted");
+            state.put("chatModel", ollama.chatModel());
+            state.put("vectorStore", "Pinecone");
+            state.put("pineconeHost", pinecone.host());
+            state.put("pineconeNamespace", pinecone.namespace());
+            state.put("pineconeAvailable", stats.isPresent());
+            state.put("embeddingModelAvailable", stats.isPresent());
+            state.put("embeddingError", pinecone.lastError());
+            state.put("ollamaAvailable", ollama.available());
+            state.put("chatModelAvailable", ollama.chatModelAvailable());
+            boolean ready = indexed && dimensions == 1024 && stats.isPresent();
+            state.put("retrieval", ready ? "hybrid BM25 + Pinecone semantic search" : "local BM25 · Pinecone index needs reindex or is unavailable");
+            state.put("ready", !chunks.isEmpty());
+            state.put("embeddingsReady", ready);
+            return state;
+        }
         long covered = vectors.coveredCount(chunks);
         Set<String> models = ollama.models();
         boolean vectorsIndexed = !chunks.isEmpty() && covered == chunks.size();
@@ -331,6 +385,7 @@ public class CodeKnowledgeService {
         boolean embeddingsReady = vectorsIndexed && dimensionsConsistent && embeddingModelAvailable;
         Map<String, Object> state = new LinkedHashMap<>();
         state.put("name", "RootLens Java source KB");
+        state.put("vectorStore", "Local TSV");
         state.put("chunks", chunks.size());
         state.put("vectors", covered);
         state.put("vectorsMissing", Math.max(0, chunks.size() - covered));

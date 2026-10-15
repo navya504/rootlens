@@ -1,5 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
+$localEnvFile = Join-Path $Root '.env'
+if (Test-Path -LiteralPath $localEnvFile) {
+    foreach ($line in Get-Content -LiteralPath $localEnvFile) {
+        if ($line -match '^\s*([^#=\s]+)\s*=\s*(.*?)\s*$') {
+            [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+        }
+    }
+}
 $Tools = Join-Path $Root '.tools'
 $JavaHome = $env:JAVA_HOME
 $MavenHome = $null
