@@ -17,12 +17,10 @@ import org.springframework.web.bind.annotation.RestController;
 public class ShopController {
     private final ShopService shop;
     private final CodeKnowledgeService knowledge;
-    private final DemoFixService demoFixes;
 
-    public ShopController(ShopService shop, CodeKnowledgeService knowledge, DemoFixService demoFixes) {
+    public ShopController(ShopService shop, CodeKnowledgeService knowledge) {
         this.shop = shop;
         this.knowledge = knowledge;
-        this.demoFixes = demoFixes;
     }
 
     @GetMapping("/shop/products")
@@ -67,22 +65,7 @@ public class ShopController {
     @GetMapping("/bugs/{id}/analyze")
     public BugAnalysis analyzeBug(@PathVariable String id) { return knowledge.analyzeBug(id); }
 
-    @PostMapping("/bugs/{id}/apply-fix")
-    public Map<String, Object> applyFix(@PathVariable String id) {
-        String bugId = id;
-        if (id.startsWith("ORD-")) {
-            Order order = shop.orders().stream().filter(item -> item.id().equals(id)).findFirst()
-                .orElseThrow(() -> new org.springframework.web.server.ResponseStatusException(org.springframework.http.HttpStatus.NOT_FOUND, "Request not found."));
-            String service = knowledge.investigate(order, shop.eventsFor(id)).suspectedService();
-            bugId = switch (service) {
-                case "payments" -> "SHOP-PAYMENT-001";
-                case "pricing" -> "SHOP-COUPON-001";
-                case "inventory" -> "SHOP-INVENTORY-001";
-                default -> throw new org.springframework.web.server.ResponseStatusException(org.springframework.http.HttpStatus.CONFLICT, "No verified demo defect is attached to this request.");
-            };
-        }
-        return demoFixes.apply(bugId);
-    }
+    // Apply-fix is intentionally disabled: analysis suggestions must not edit source files on the running server.
 
     @PostMapping("/demo/bugs/{id}/reproduce")
     public CheckoutResult reproduceDefect(@PathVariable String id) {
