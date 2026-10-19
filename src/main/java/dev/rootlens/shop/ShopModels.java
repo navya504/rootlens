@@ -38,9 +38,13 @@ public final class ShopModels {
     public record Answer(String query, String answer, String rootCause, String whyItHappened, String remediation,
                          String codeFix,
                          String retrieval, String answerMode, List<CodeSource> sources,
-                         List<VectorPoint> vectorPoints) {}
+                         List<VectorPoint> vectorPoints, String severity, String suspectedService, String telemetrySignal,
+                         String assessment) {}
+    public record GeneratedRca(String answer, String rootCause, String whyItHappened, String remediation,
+                               String codeFix, String severity, String suspectedService, String telemetrySignal,
+                               String assessment) {}
     public record RcaReport(String orderId, String correlationId, String severity, String suspectedService,
-                            String telemetrySignal, String rootCause, String whyItHappened, String remediation, String codeFix,
+                            String telemetrySignal, String assessment, String rootCause, String whyItHappened, String remediation, String codeFix,
                             String retrieval, String answerMode, int traceEventCount, List<CodeSource> sources,
                             List<VectorPoint> vectorPoints) {}
 }

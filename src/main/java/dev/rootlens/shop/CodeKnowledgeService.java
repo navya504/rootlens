@@ -19,9 +19,12 @@ import java.util.regex.Pattern;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Service
 public class CodeKnowledgeService {
+    private static final Logger LOGGER = LoggerFactory.getLogger(CodeKnowledgeService.class);
     private static final Pattern METHOD = Pattern.compile("^\\s*(?:public|protected|private)\\s+(?:(?:static|final|synchronized)\\s+)*(?:<[\\w, ? extends]+>\\s+)?[\\w.$<>?,\\[\\]]+\\s+(\\w+)\\s*\\(.*$");
     private static final Set<String> STOP_WORDS = Set.of("the", "why", "what", "how", "does", "this", "that", "with", "from", "when", "where", "is", "are", "a", "an", "to", "in", "of", "for", "it", "my", "i", "we");
     private static final Map<String, List<String>> ALIASES = Map.of(
@@ -133,10 +136,10 @@ public class CodeKnowledgeService {
     }
 
     public Answer ask(String question) {
-        return ask(question, true);
+        return ask(question, "");
     }
 
-    private Answer ask(String question, boolean generateWithLocalModel) {
+    private Answer ask(String question, String investigationContext) {
         if (question == null || question.isBlank()) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Ask a question about the shop behavior.");
         if (question.length() > 500) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Keep the question under 500 characters.");
         List<CodeSource> chunks = index();
@@ -178,15 +181,19 @@ public class CodeKnowledgeService {
         String retrieval = hybrid
             ? "hybrid retrieval · 45% BM25 + 55% cosine similarity · " + (pinecone.configured() ? "Pinecone llama-text-embed-v2" : ollama.embeddingModel())
             : "local BM25 · method-level source chunks with file and line citations";
-        var generated = generateWithLocalModel && !ranked.isEmpty()
-            ? ollama.generate(question, ranked) : java.util.Optional.<String>empty();
-        Diagnosis guidance = diagnose(question, ranked);
-        String answer = generated.orElse(guidance.rootCause() + " " + guidance.whyItHappened() + " " + guidance.remediation());
-        return new Answer(question, answer, guidance.rootCause(), guidance.whyItHappened(), guidance.remediation(), guidance.codeFix(), retrieval,
-            generated.isPresent() ? "Local model · " + ollama.chatModel()
-                : generateWithLocalModel ? "Built-in demo explanation · local chat unavailable or timed out"
-                : "Built-in demo explanation · deterministic sample RCA",
-            excerpts(ranked, question), points);
+        GeneratedRca generated;
+        try {
+            generated = ollama.generateRca(question, investigationContext, ranked);
+        } catch (IllegalStateException exception) {
+            LOGGER.error("LLM-generated RCA failed for question: {}", question, exception);
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, exception.getMessage(), exception);
+        }
+        if (generated.codeFix() == null || generated.codeFix().isBlank()) {
+            LOGGER.warn("RCA generated without an illustrative code snippet for question: {}", question);
+        }
+        return new Answer(question, generated.answer(), generated.rootCause(), generated.whyItHappened(), generated.remediation(),
+            generated.codeFix() == null ? "" : generated.codeFix(), retrieval, "Ollama · " + ollama.chatModel(),
+            excerpts(ranked, question), points, generated.severity(), generated.suspectedService(), generated.telemetrySignal(), generated.assessment());
     }
 
     public List<BugDefinition> knownBugs() {
@@ -206,11 +213,14 @@ public class CodeKnowledgeService {
     public BugAnalysis analyzeBug(String bugId) {
         BugDefinition bug = knownBugs().stream().filter(item -> item.id().equalsIgnoreCase(bugId)).findFirst()
             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Bug not found."));
-        Answer answer = ask(bug.question(), false);
-        String status = answer.sources().isEmpty() ? "INCONCLUSIVE" : "EVIDENCE FOUND";
+        String context = "Known defect: " + bug.title() + " (" + bug.id() + "). Service: " + bug.service()
+            + ". Catalog severity: " + bug.severity() + ". Reported behavior: " + bug.summary()
+            + ". Reproduction: " + bug.trigger() + ". Assess the report against retrieved source; do not assume the catalog description is proven.";
+        Answer answer = ask(bug.question(), context);
+        String status = answer.assessment();
         StringBuilder report = new StringBuilder("# ").append(bug.title()).append("\n\n")
-            .append("- **Bug ID:** ").append(bug.id()).append("\n- **Service:** ").append(bug.service())
-            .append("\n- **Severity:** ").append(bug.severity()).append("\n- **Assessment:** ").append(status)
+            .append("- **Bug ID:** ").append(bug.id()).append("\n- **Service:** ").append(answer.suspectedService())
+            .append("\n- **Severity:** ").append(answer.severity()).append("\n- **Assessment:** ").append(status)
             .append("\n- **Retrieval:** ").append(answer.retrieval()).append("\n\n")
             .append("## Root cause\n\n").append(answer.rootCause()).append("\n\n")
             .append("## Why it happened\n\n").append(answer.whyItHappened()).append("\n\n")
@@ -224,8 +234,8 @@ public class CodeKnowledgeService {
         if (!answer.codeFix().isBlank()) report.append("\n## Suggested code change\n\n```java\n")
             .append(answer.codeFix()).append("\n```\n");
         report.append("\n## Retrieval details\n\n").append(answer.answerMode()).append("\n\n")
-            .append("Generated locally by RootLens from the indexed source chunks. Retrieval scores rank evidence; they are not calibrated probabilities.\n");
-        return new BugAnalysis(bug.id(), bug.title(), bug.service(), bug.severity(), status,
+            .append("Generated by ").append(answer.answerMode()).append(" from retrieved source evidence. Retrieval scores rank evidence; they are not calibrated probabilities.\n");
+        return new BugAnalysis(bug.id(), bug.title(), answer.suspectedService(), answer.severity(), status,
             answer.rootCause(), answer.whyItHappened(), answer.remediation(), answer.codeFix(),
             answer.retrieval(), answer.answerMode(), answer.sources(), answer.vectorPoints(), report.toString());
     }
@@ -290,56 +300,21 @@ public class CodeKnowledgeService {
 
     public RcaReport investigate(Order order, List<ShopEvent> requestEvents) {
         List<ShopEvent> trace = requestEvents.stream().sorted(Comparator.comparing(ShopEvent::at)).toList();
-        boolean duplicatePayment = trace.stream().anyMatch(event -> event.event().equals("payment.retry_captured"))
-            || order.paymentCaptures() > 1;
-        boolean paymentUncertain = trace.stream().anyMatch(event -> event.event().equals("payment.response_timeout"));
-        boolean couponApplied = trace.stream().anyMatch(event -> event.event().equals("coupon.applied")
-            && event.detail().toUpperCase(Locale.ROOT).contains("ROOT10"));
-        boolean inventoryReserved = trace.stream().anyMatch(event -> event.event().equals("inventory.reserved"));
-
-        String severity = duplicatePayment ? "HIGH" : paymentUncertain ? "MEDIUM" : couponApplied ? "MEDIUM" : "INFO";
-        String service = duplicatePayment || paymentUncertain ? "payments" : couponApplied ? "pricing" : inventoryReserved ? "inventory" : "checkout";
-        String signal = duplicatePayment
-            ? "Telemetry shows an ambiguous payment response followed by a retry capture; this order recorded " + order.paymentCaptures() + " captures."
-            : paymentUncertain
-                ? "Telemetry shows an ambiguous payment response. Confirm the capture state before retrying."
-                : couponApplied
-                    ? "Telemetry confirms ROOT10 was applied during checkout. The trace records the actual amount deducted; compare it with the 10% label shown in the cart."
-                    : inventoryReserved
-                        ? "Telemetry shows inventory accepted for this checkout. The source check can confirm how reservation changes stock."
-                        : "No warning or error signal was recorded for this request; showing the checkout flow's source evidence.";
-        String question = duplicatePayment || paymentUncertain ? "Why did the customer get charged twice?"
-            : couponApplied ? "Why was the ROOT10 coupon discount wrong?"
-            : inventoryReserved ? "Why can the shop oversell stock?"
-            : "How does checkout process this order?";
-        Answer evidence = ask(question, false);
-        String rootCause;
-        String why;
-        String remediation;
-        if (duplicatePayment) {
-            rootCause = "ShopService charged this order twice: PaymentService captured the $189 payment, its response timed out, and checkout retried with a different idempotency key.";
-            why = "The event sequence is checkout started → payment response timeout → retry captured → order confirmed. In this demo, PaymentService simulates that timeout for orders of $100 or more, after it has already recorded the first capture. A timeout means the caller did not receive a timely response; it does not mean the gateway rolled back the capture. ShopService then changes the key from `orderId-payment` to `orderId-payment-retry`, so the gateway treats the retry as a new charge. The two entries in the payment ledger confirm the duplicate.";
-            remediation = "Use one stable idempotency key for every attempt belonging to this order. After a timeout, query or reconcile the gateway by that key before retrying. If the gateway confirms a capture, continue without charging again; if the result remains unknown, keep the order pending and reconcile asynchronously. Add a unique database constraint for the order/payment key so concurrent retries cannot create duplicate captures.";
-        } else if (paymentUncertain) {
-            rootCause = "The payment outcome is unknown because the gateway response timed out; this trace does not prove whether the charge was captured.";
-            why = "A timeout is a communication failure between the application and gateway, not a definitive payment failure. If checkout treats it as failed and sends a new payment with a new key, the first charge may later settle too, producing a duplicate. The current trace has no retry capture, so this is a risk rather than a confirmed duplicate.";
-            remediation = "Keep the order in a pending-payment state. Reconcile the gateway using the original idempotency key, then mark the order paid or failed from the authoritative gateway result. Do not create another key while the first attempt is unresolved.";
-        } else if (couponApplied) {
-            rootCause = "ROOT10 is presented in the cart with a ‘10% discount’ label, but the applied coupon rule deducts a flat $10.";
-            why = "The coupon label describes a percentage offer while PricingService applies a fixed-dollar amount. The checkout trace shows the actual $10 deduction; this is misleading offer copy, not a frontend calculation error or a rounding difference.";
-            remediation = "Make ROOT10 a true 10% discount in PricingService by calculating 10% of the subtotal, capped at the subtotal. Use that single calculated amount for the cart display, order total, and checkout confirmation; for a $249 subtotal, all three should show $24.90 off.";
-        } else if (inventoryReserved) {
-            rootCause = "InventoryService.reserve() accepts the item after checking quantity, but it never records the reservation or reduces available stock.";
-            why = "The trace confirms inventory accepted this checkout. In the implementation, reserve() reads available(product.id()) and returns whether it is large enough, but there is no write that subtracts quantity. A later checkout therefore reads the original count and is accepted too. Two simultaneous requests can both read the same count and both pass, even if a decrement is added after the check; the check and update must be atomic. This order’s telemetry confirms acceptance, while the source code explains the oversell risk.";
-            remediation = "Replace the check-only path with an atomic conditional stock decrement. Reject the order when the update affects zero rows or insufficient stock remains. Keep a reservation ID so it can be released if payment fails; in a multi-instance deployment, enforce this in the database rather than with an in-memory map.";
-        } else {
-            rootCause = "This request trace contains no clear failure signal.";
-            why = "The observed events show the checkout flow, but they do not identify a failed or inconsistent outcome for this order.";
-            remediation = "Compare the expected outcome with the order and payment records, then add a structured error event at the first point where they diverge.";
-        }
-        String codeFix = evidence.codeFix();
-        return new RcaReport(order.id(), order.correlationId(), severity, service, signal, rootCause, why, remediation,
-            codeFix, evidence.retrieval(), "Telemetry rules · " + evidence.answerMode(), trace.size(), evidence.sources(), evidence.vectorPoints());
+        String question = "Analyze this shopping order for a defect or unexpected outcome. Explain what the observed events and source code establish, why it happened, and how to remediate it.";
+        StringBuilder context = new StringBuilder()
+            .append("Order ID: ").append(order.id()).append("\nCorrelation ID: ").append(order.correlationId())
+            .append("\nOrder status: ").append(order.status()).append("\nSubtotal: ").append(order.subtotal())
+            .append("\nDiscount: ").append(order.discount()).append("\nTotal: ").append(order.total())
+            .append("\nPayment capture count: ").append(order.paymentCaptures())
+            .append("\nCoupon: ").append(order.couponCode()).append("\nObserved event sequence (timestamp order):\n");
+        if (trace.isEmpty()) context.append("No events were recorded for this order.\n");
+        for (ShopEvent event : trace) context.append(event.at()).append(" · ").append(event.service()).append(" · ")
+            .append(event.event()).append(" · ").append(event.level()).append(" · ").append(event.detail()).append("\n");
+        Answer analysis = ask(question, context.toString());
+        return new RcaReport(order.id(), order.correlationId(), analysis.severity(), analysis.suspectedService(),
+            analysis.telemetrySignal(), analysis.assessment(), analysis.rootCause(), analysis.whyItHappened(), analysis.remediation(),
+            analysis.codeFix(), analysis.retrieval(),
+            analysis.answerMode(), trace.size(), analysis.sources(), analysis.vectorPoints());
     }
 
     private Map<String, Object> statusSnapshot() {
@@ -556,8 +531,7 @@ public class CodeKnowledgeService {
             .stream().anyMatch(query::contains);
         if (!shopBehaviorQuestion || asksAboutRootLens) return chunks;
 
-        // The RCA service contains canned sample questions and explanations. Keep it searchable for RootLens questions,
-        // but don't let those prompt strings outrank the storefront implementation for shop-behavior investigations.
+        // Keep RCA prompts searchable for RootLens questions, but don't let analysis plumbing outrank the storefront implementation.
         return chunks.stream().filter(chunk -> !chunk.path().endsWith("/CodeKnowledgeService.java")).toList();
     }
 
@@ -568,38 +542,5 @@ public class CodeKnowledgeService {
         return result;
     }
 
-    private Diagnosis diagnose(String question, List<CodeSource> sources) {
-        if (sources.isEmpty()) return new Diagnosis(
-            "No matching source passage was retrieved, so RootLens cannot support a code-level root cause yet.",
-            "The query may use different terms from the indexed methods, or the relevant behavior may not be in the indexed source set.",
-            "Try a specific service or behavior such as coupon pricing, payment retry, stock reservation, or checkout; then inspect the cited chunks before acting.", "");
-        String q = question.toLowerCase(Locale.ROOT);
-        if ((q.contains("coupon") || q.contains("discount") || q.contains("root10")) && sources.stream().anyMatch(s -> s.symbol().equals("discount"))) {
-            return new Diagnosis(
-                "ROOT10 is labelled ‘10% discount’ in the cart, but PricingService.discount() applies a fixed $10. The issue is that the offer wording does not match the amount deducted.",
-                "The cart intentionally presents ROOT10 as a 10% discount, while PricingService uses a flat $10 rule. A $249 order therefore shows a $10 deduction, not $24.90. This is a mismatch in the coupon label and applied amount, not a separate preview calculation or a rounding difference.",
-                "Make ROOT10 a true 10% discount in PricingService by calculating 10% of the subtotal, capped at the subtotal. Use that single calculated amount for the cart display, order total, and checkout confirmation; for a $249 subtotal, all three should show $24.90 off.",
-                "const discount = couponApplied ? subtotal * 0.1 : 0;\nreturn { subtotal, discount, total: subtotal - discount };");
-        }
-        if ((q.contains("twice") || q.contains("duplicate") || q.contains("payment") || q.contains("charged")) && sources.stream().anyMatch(s -> s.symbol().equals("checkout") || s.symbol().equals("capture"))) {
-            return new Diagnosis(
-                "ShopService can charge the same order twice because its retry uses a different idempotency key from the original payment attempt.",
-                "The first gateway call may capture the money and then time out before the application receives the response. The catch block treats that missing response as a reason to retry. Since it changes the key from `orderId-payment` to `orderId-payment-retry`, the gateway sees a new payment and creates a second capture. A timeout is an unknown outcome, not proof that the first capture failed.",
-                "Keep one stable key per order/payment. After a timeout, look up the gateway result by that key before attempting another capture. If captured, continue without charging again; if not found, retry with the same key; if still unknown, leave the order pending for reconciliation. Enforce uniqueness for the key in the payment store so concurrent retries are deduplicated too.",
-                "String key = orderId + \"-payment\"; // same key for every attempt\nPaymentStatus status = gateway.lookup(key);\nif (status == PaymentStatus.CAPTURED) {\n    markPaid(orderId);\n} else if (status == PaymentStatus.NOT_FOUND) {\n    gateway.capture(orderId, total, key);\n} else {\n    markPendingForReconciliation(orderId, key);\n}");
-        }
-        if ((q.contains("stock") || q.contains("inventory") || q.contains("oversell")) && sources.stream().anyMatch(s -> s.symbol().equals("reserve") || s.symbol().equals("available"))) {
-            return new Diagnosis(
-                "InventoryService.reserve() approves the checkout after a stock check but never records or subtracts the reserved quantity. The inventory count therefore remains unchanged.",
-                "The method currently returns `available(product.id()) >= quantity` directly. That expression only answers whether the current count is sufficient; it does not mutate the count. Every later checkout reads the same count and can also be accepted. Simply adding a separate decrement after this check is still unsafe under concurrency: two requests can both read the same quantity before either writes. The read/check/update must be one atomic operation. The selected order's `inventory.reserved` event confirms this request passed the check; the code explains why repeated or concurrent checkouts can oversell.",
-                "Make the inventory map mutable and perform the conditional decrement atomically. Reject non-positive quantities and requests larger than the remaining stock. Release the quantity if a later payment step fails. For a multi-instance production service, use a database conditional update such as `UPDATE inventory SET available = available - :qty WHERE product_id = :id AND available >= :qty` and require exactly one updated row.",
-                "import java.util.concurrent.ConcurrentHashMap;\n\nprivate final Map<String, Integer> available = new ConcurrentHashMap<>(Map.of(\n    \"audio-pro\", 3, \"mechanical-keys\", 8,\n    \"desk-light\", 5, \"webcam-4k\", 2));\n\npublic synchronized boolean reserve(Product product, int quantity) {\n    int onHand = available(product.id());\n    if (quantity <= 0 || onHand < quantity) return false;\n    available.put(product.id(), onHand - quantity);\n    return true;\n}");
-        }
-        return new Diagnosis(
-            "Related code was retrieved, but the evidence does not establish a specific defect for this question.",
-            "The cited methods show the relevant execution path. Compare their conditions and state changes with the behavior you observed; a source match alone does not prove a runtime failure.",
-            "Share the affected order or request trace, or narrow the question to a concrete behavior. RootLens can then connect telemetry to the cited code path.", "");
-    }
 
-    private record Diagnosis(String rootCause, String whyItHappened, String remediation, String codeFix) {}
 }

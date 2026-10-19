@@ -29,7 +29,7 @@ Payments are simulated; the demo never contacts a payment provider or handles ca
 
 ## Incident investigation and RCA
 
-Open `/dev` to investigate the three reproducible shopping-app defects. The dark operations dashboard lists the bugs and real requests from the current app session. Selecting **Analyse defect** retrieves source evidence, explains the likely cause, shows remediation and ranked citations, and prepares an RCA report. The report can be exported as Markdown. Selecting a real request shows its observed event sequence; the interface does not invent span durations or incident timestamps.
+Open `/dev` to investigate the three reproducible shopping-app defects. The dark operations dashboard lists the bugs and real requests from the current app session. Selecting **Analyse defect** retrieves source evidence and asks the configured Ollama chat model to generate the root cause, explanation, remediation, severity, and suggested code pattern. Selecting a real request sends its observed event sequence and order facts with the retrieved code evidence for an LLM-generated RCA. Reports can be exported as Markdown. If the chat model is unavailable or returns invalid output, analysis fails visibly; RootLens does not substitute a rule-written RCA.
 
 Open `/view` for the Spring Boot shopping application dependency map. It shows the relationships among `ShopController`, `ShopService`, `InventoryService`, `PricingService`, `PaymentService`, and `ShopModels`, with source inspection for each component. The map is based on application service dependencies and does not expose RAG indexing internals.
 
@@ -49,7 +49,7 @@ Observed orders and mock payment records live in memory and reset when the app r
 
 ### Pinecone vector search
 
-RootLens can use the configured Pinecone serverless index with its integrated `llama-text-embed-v2` model (1024 dimensions, cosine metric). Pinecone generates embeddings for indexed code chunks and search queries; Ollama remains optional for local answer generation. Configure these environment variables before starting RootLens:
+RootLens can use the configured Pinecone serverless index with its integrated `llama-text-embed-v2` model (1024 dimensions, cosine metric). Pinecone generates embeddings for indexed code chunks and search queries. Ollama chat is required for RCA generation even when Pinecone is used. Configure these environment variables before starting RootLens:
 
 ```powershell
 $env:PINECONE_API_KEY = '<your Pinecone API key>'
@@ -60,9 +60,9 @@ $env:PINECONE_NAMESPACE = 'rootlens-dev'
 
 The API key is read only from the environment and must not be committed to the repository. Pinecone becomes the vector backend only when the key is present; otherwise the app retains the local vector/BM25 behavior. Code chunks are sent to Pinecone for indexing and semantic search, so use this mode only where that source-code transfer is allowed. Select **Reindex source** from `/dev` after configuring the connection.
 
-### Optional local embeddings and answer generation
+### Ollama for RCA generation and optional local embeddings
 
-Without Ollama, RootLens runs local BM25 retrieval and built-in demo explanations. With Ollama, the app can make embeddings, blend BM25 with cosine similarity, save vectors to `.rootlens/code-vectors.tsv`, and generate evidence-grounded answers locally. Embedding diagnostics remain part of local retrieval configuration and are not shown on the shopping application dependency map.
+RootLens always uses the configured Ollama chat model to generate explanations, root causes, remediations, and code suggestions from retrieved evidence. When Ollama is unavailable, RCA endpoints return an error instead of using hardcoded analysis. Ollama can also create local embeddings, blend BM25 with cosine similarity, and save vectors to `.rootlens/code-vectors.tsv`; Pinecone can provide semantic retrieval instead. Embedding diagnostics remain part of local retrieval configuration and are not shown on the shopping application dependency map.
 
 1. Install and start Ollama for Windows. Keep it running while RootLens is open.
 2. In PowerShell, download the configured models (about 3.2 GB total):
@@ -74,7 +74,7 @@ Without Ollama, RootLens runs local BM25 retrieval and built-in demo explanation
 
 3. Restart RootLens, open `/dev`, and press **Reindex source**. The source status indicates whether local vectors are ready. Bug analysis uses hybrid source retrieval when embeddings are available and falls back to BM25 otherwise.
 
-Model names can be changed with `ROOTLENS_EMBEDDING_MODEL` and `ROOTLENS_CHAT_MODEL`; Ollama's URL can be changed with `OLLAMA_BASE_URL`. The embedding model is about 639 MB and the chat model about 2.5 GB according to Ollama's model library ([embedding model](https://ollama.com/library/qwen3-embedding), [chat model](https://ollama.com/library/qwen3%3A4b)). These downloads are optional; no model is downloaded by the app itself. If the embedding model is missing or Ollama is stopped, it stays in BM25 mode.
+Model names can be changed with `ROOTLENS_EMBEDDING_MODEL` and `ROOTLENS_CHAT_MODEL`; Ollama's URL can be changed with `OLLAMA_BASE_URL`. The embedding model is about 639 MB and the chat model about 2.5 GB according to Ollama's model library ([embedding model](https://ollama.com/library/qwen3-embedding), [chat model](https://ollama.com/library/qwen3%3A4b)). These downloads are optional; no model is downloaded by the app itself. If the embedding model is missing, retrieval stays in BM25 mode; if Ollama chat is stopped, RCA generation is unavailable.
 
 The vector index is a persistent local exact-search store suited to this small source set. It is not a distributed vector database. The current app is a local demonstration: the sample defects, in-memory orders, and mock payment ledger are not a production incident data pipeline.
 
